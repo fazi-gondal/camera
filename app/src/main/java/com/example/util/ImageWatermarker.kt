@@ -22,11 +22,34 @@ object ImageWatermarker {
         photoFile: File,
         customText: String,
         colorHex: String,
-        styleIndex: Int // 0: Standard, 1: Retro Digital, 2: Neon Banner, 3: Classic Left
+        styleIndex: Int, // 0: Standard, 1: Retro Digital, 2: Neon Banner, 3: Classic Left
+        filterIndex: Int
     ) {
         try {
             val filepath = photoFile.absolutePath
-            val bitmap = BitmapFactory.decodeFile(filepath) ?: return
+
+            // Proactively determine image dimensions in a memory-safe boundary
+            val options = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            BitmapFactory.decodeFile(filepath, options)
+
+            // Define modern memory-safe max texture dimension (2048px is very high quality but memory safe)
+            val maxDimension = 2048
+            var inSampleSize = 1
+            if (options.outWidth > maxDimension || options.outHeight > maxDimension) {
+                val halfHeight = options.outHeight / 2
+                val halfWidth = options.outWidth / 2
+                while ((halfHeight / inSampleSize) >= maxDimension && (halfWidth / inSampleSize) >= maxDimension) {
+                    inSampleSize *= 2
+                }
+            }
+
+            // Decode the actual bitmap downsampled to target size to avoid any OOM on emulators
+            val decodeOptions = BitmapFactory.Options().apply {
+                this.inSampleSize = inSampleSize
+            }
+            val bitmap = BitmapFactory.decodeFile(filepath, decodeOptions) ?: return
 
             // Load and parse EXIF orientation
             val exif = try {
@@ -55,13 +78,68 @@ object ImageWatermarker {
                 bitmap
             }
 
-            val mutableBitmap = rotatedBitmap.copy(Bitmap.Config.ARGB_8888, true)
+            val mutableBitmap = Bitmap.createBitmap(rotatedBitmap.width, rotatedBitmap.height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(mutableBitmap)
+            val filterPaint = Paint().apply {
+                isAntiAlias = true
+                if (filterIndex > 0) {
+                    val colorMatrix = when (filterIndex) {
+                        1 -> { // 1: Warm Vintage (Yellowish warm saturation boost)
+                            android.graphics.ColorMatrix(floatArrayOf(
+                                1.15f, 0f,    0f,    0f,  20f,
+                                0f,    1.05f, 0f,    0f,  10f,
+                                0f,    0f,    0.85f, 0f,  -15f,
+                                0f,    0f,    0f,    1f,  0f
+                            ))
+                        }
+                        2 -> { // 2: Noir Noir / Mono (Grayscale)
+                            android.graphics.ColorMatrix().apply {
+                                setSaturation(0f)
+                                val scale = 1.15f
+                                val translate = -10f
+                                postConcat(android.graphics.ColorMatrix(floatArrayOf(
+                                    scale, 0f,    0f,    0f, translate,
+                                    0f,    scale, 0f,    0f, translate,
+                                    0f,    0f,    scale, 0f, translate,
+                                    0f,    0f,    0f,    1f, 0f
+                                )))
+                            }
+                        }
+                        3 -> { // 3: Cool Neon (Blue/Violet Cyberpunk)
+                            android.graphics.ColorMatrix(floatArrayOf(
+                                0.75f, 0f,    0.35f, 0f, -5f,
+                                0f,    1.15f, 0f,    0f,  15f,
+                                0.25f, 0f,    1.4f,  0f,  30f,
+                                0f,    0f,    0f,    1f,  0f
+                            ))
+                        }
+                        4 -> { // 4: Vintage Sepia (Golden Hour)
+                            android.graphics.ColorMatrix(floatArrayOf(
+                                0.393f, 0.769f, 0.189f, 0f, 0f,
+                                0.349f, 0.686f, 0.168f, 0f, 0f,
+                                0.272f, 0.534f, 0.131f, 0f, 0f,
+                                0f,     0f,     0f,     1f, 0f
+                            ))
+                        }
+                        5 -> { // 5: High Vivid (Epic saturation)
+                            android.graphics.ColorMatrix().apply {
+                                setSaturation(1.4f)
+                            }
+                        }
+                        else -> null
+                    }
+                    if (colorMatrix != null) {
+                        colorFilter = android.graphics.ColorMatrixColorFilter(colorMatrix)
+                    }
+                }
+            }
+            canvas.drawBitmap(rotatedBitmap, 0f, 0f, filterPaint)
+
             if (rotatedBitmap != bitmap) {
                 rotatedBitmap.recycle()
             }
             bitmap.recycle()
 
-            val canvas = Canvas(mutableBitmap)
             val width = canvas.width
             val height = canvas.height
 

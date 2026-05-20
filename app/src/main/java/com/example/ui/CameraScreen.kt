@@ -57,12 +57,15 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import com.example.data.PhotoEntity
 import com.example.util.ImageWatermarker
+import android.content.pm.PackageManager
 import com.example.R
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -76,12 +79,36 @@ fun CameraScreen(
     val context = LocalContext.current
     val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
 
+    var hasPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    LaunchedEffect(cameraPermissionState.status.isGranted) {
+        if (cameraPermissionState.status.isGranted) {
+            hasPermission = true
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val systemGranted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!systemGranted) {
+            cameraPermissionState.launchPermissionRequest()
+        } else {
+            hasPermission = true
+        }
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFF121212)) // Dark atmospheric backdrop
     ) {
-        if (cameraPermissionState.status.isGranted) {
+        if (hasPermission) {
             CameraContent(viewModel = viewModel)
         } else {
             PermissionGateway(
@@ -186,17 +213,21 @@ fun CameraContent(
     val isCapturing by viewModel.isCapturing.collectAsStateWithLifecycle()
     val selectedColorHex by viewModel.selectedColorHex.collectAsStateWithLifecycle()
     val selectedStyleIndex by viewModel.selectedStyleIndex.collectAsStateWithLifecycle()
+    val selectedFilterIndex by viewModel.selectedFilterIndex.collectAsStateWithLifecycle()
     val noteText by viewModel.noteText.collectAsStateWithLifecycle()
 
     // Camera Configuration State variables
     var lensFacing by remember { mutableStateOf(CameraSelector.LENS_FACING_BACK) }
     var activePhotoView by remember { mutableStateOf<PhotoEntity?>(null) }
     var flashMode by remember { mutableStateOf(ImageCapture.FLASH_MODE_OFF) }
+    var isTorchEnabled by remember { mutableStateOf(false) }
 
     // Setup CameraX ImageCapture and Provider listeners
     val imageCapture = remember { ImageCapture.Builder().build() }
     val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
     var cameraBoundState by remember { mutableStateOf(false) }
+    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
+    var cameraInstance by remember { mutableStateOf<androidx.camera.core.Camera?>(null) }
 
     // Live tick clock for real-time stamp overlay synchronization
     var currentTickTime by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -210,121 +241,179 @@ fun CameraContent(
     // Capture Trigger executor
     val mainExecutor = remember(context) { ContextCompat.getMainExecutor(context) }
 
-    // Re-bind camera state on lens or configuration switches
-    LaunchedEffect(lensFacing, flashMode) {
-        imageCapture.flashMode = flashMode
+    // Re-apply correct flashMode safely without needing to rebind the entire camera!
+    LaunchedEffect(flashMode) {
         try {
-            val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build()
+            imageCapture.flashMode = flashMode
+        } catch (e: Exception) {
+            Log.e("CameraContent", "Failed setting flashMode on capture", e)
+        }
+    }
+
+    // Toggle torch state dynamically on active camera instance when state changes
+    LaunchedEffect(cameraInstance, isTorchEnabled) {
+        try {
+            cameraInstance?.cameraControl?.enableTorch(isTorchEnabled)
+        } catch (e: Exception) {
+            Log.e("CameraContent", "Failed to toggle flashlight/torch", e)
+        }
+    }
+
+    // Safe, single-point of binding CameraX once PreviewView is ready & states switch!
+    LaunchedEffect(previewViewRef, lensFacing) {
+        val previewView = previewViewRef ?: return@LaunchedEffect
+        try {
+            val cameraProvider = kotlinx.coroutines.suspendCancellableCoroutine<ProcessCameraProvider> { continuation ->
+                cameraProviderFuture.addListener({
+                    try {
+                        continuation.resume(cameraProviderFuture.get(), onCancellation = null)
+                    } catch (e: Exception) {
+                        continuation.resumeWithException(e)
+                    }
+                }, mainExecutor)
+            }
 
             cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
+
+            // Resolve actual target camera selector, defaulting to available selectors to prevent crash if front lens is missing
+            val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+            val finalSelector = if (cameraProvider.hasCamera(selector)) {
+                selector
+            } else {
+                val alternativeLens = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                    CameraSelector.LENS_FACING_FRONT
+                } else {
+                    CameraSelector.LENS_FACING_BACK
+                }
+                val alternativeSelector = CameraSelector.Builder().requireLensFacing(alternativeLens).build()
+                if (cameraProvider.hasCamera(alternativeSelector)) {
+                    lensFacing = alternativeLens
+                    alternativeSelector
+                } else {
+                    selector
+                }
+            }
+
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+            val camera = cameraProvider.bindToLifecycle(
                 lifecycleOwner,
-                CameraSelector.Builder().requireLensFacing(lensFacing).build(),
+                finalSelector,
                 preview,
                 imageCapture
             )
+            cameraInstance = camera
+
+            // Reapply torch state to the newly bound camera
+            try {
+                camera.cameraControl.enableTorch(isTorchEnabled)
+            } catch (e: Exception) {
+                Log.e("CameraContent", "Could not apply torch state to model", e)
+            }
+
             cameraBoundState = true
         } catch (e: Exception) {
             Log.e("CameraContent", "Binding failed dynamically", e)
         }
     }
 
-    Scaffold(
-        modifier = Modifier.fillMaxSize(),
-        containerColor = Color(0xFF0F0F0F)
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
+    Box(
+        modifier = Modifier.fillMaxSize()
+    ) {
+        // VIEWPORT CONTAINER - Full Screen Edge-to-Edge Background
+        Box(
+            modifier = Modifier.fillMaxSize()
         ) {
-            // VIEWPORT CONTAINER - Top 55%
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1.3f)
-                    .background(Color.Black)
-            ) {
-                if (cameraBoundState) {
-                    AndroidView(
-                        factory = { ctx ->
-                            val previewView = PreviewView(ctx).apply {
-                                scaleType = PreviewView.ScaleType.FILL_CENTER
-                            }
-                            cameraProviderFuture.addListener({
-                                try {
-                                    val cameraProvider = cameraProviderFuture.get()
-                                    val preview = Preview.Builder().build().also {
-                                        it.setSurfaceProvider(previewView.surfaceProvider)
-                                    }
-                                    cameraProvider.unbindAll()
-                                    cameraProvider.bindToLifecycle(
-                                        lifecycleOwner,
-                                        CameraSelector.Builder().requireLensFacing(lensFacing).build(),
-                                        preview,
-                                        imageCapture
-                                    )
-                                } catch (e: Exception) {
-                                    Log.e("CameraViewport", "Bind to preview failed", e)
-                                }
-                            }, mainExecutor)
-                            previewView
-                        },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier.fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(color = Color(0xFFFF5722))
+            // Always render AndroidView in composition so that PreviewView is properly initialized
+            AndroidView(
+                factory = { ctx ->
+                    PreviewView(ctx).apply {
+                        scaleType = PreviewView.ScaleType.FILL_CENTER
+                        previewViewRef = this
                     }
-                }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
 
-                // VIBRANT SURFACE GRID & CROSSHAIRS PREVIEW INDICATOR
+            if (!cameraBoundState) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .border(BorderStroke(1.dp, Color(0x22FFFFFF)))
-                )
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator(color = Color(0xFFFF5722))
+                }
+            }
 
-                // OVERLAY TOP BAR: Flash & Flip Controls
-                Row(
+            // VIBRANT SURFACE GRID & CROSSHAIRS PREVIEW INDICATOR
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .border(BorderStroke(1.dp, Color(0x11FFFFFF)))
+            )
+        }
+
+        // CONTROL OVERLAYS - Glassy / Semi-transparent panels laid out vertically
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            // OVERLAY TOP BAR: Flash, Status Indicator & Lens Flip
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0x7F000000))
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Flash Mode Toggle Button
+                IconButton(
+                    onClick = {
+                        if (isTorchEnabled) {
+                            // Transition: Torch -> Off
+                            isTorchEnabled = false
+                            flashMode = ImageCapture.FLASH_MODE_OFF
+                            Toast.makeText(context, "Flash/Flashlight Off", Toast.LENGTH_SHORT).show()
+                        } else if (flashMode == ImageCapture.FLASH_MODE_OFF) {
+                            // Transition: Off -> Flash On (fires during capture)
+                            flashMode = ImageCapture.FLASH_MODE_ON
+                            isTorchEnabled = false
+                            Toast.makeText(context, "Flash On (during capture)", Toast.LENGTH_SHORT).show()
+                        } else {
+                            // Transition: Flash On -> Torch (continuous flashlight)
+                            flashMode = ImageCapture.FLASH_MODE_OFF
+                            isTorchEnabled = true
+                            Toast.makeText(context, "Flashlight On (continuous stream)", Toast.LENGTH_SHORT).show()
+                        }
+                    },
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp)
-                        .align(Alignment.TopCenter),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                        .background(Color(0x7F212121), CircleShape)
+                        .testTag("flash_toggle_button")
+                ) {
+                    val icon = when {
+                        isTorchEnabled -> Icons.Default.FlashOn
+                        flashMode == ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashAuto
+                        else -> Icons.Default.FlashOff
+                    }
+                    val tintColor = when {
+                        isTorchEnabled -> Color(0xFF00E676) // Neon Green
+                        flashMode == ImageCapture.FLASH_MODE_ON -> Color(0xFFFFEB3B) // Yellow
+                        else -> Color.White
+                    }
+                    Icon(icon, contentDescription = "Flash Options", tint = tintColor)
+                }
+
+                // Watermark & Filter active badges
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Flash Mode Toggle Button
-                    IconButton(
-                        onClick = {
-                            flashMode = when (flashMode) {
-                                ImageCapture.FLASH_MODE_OFF -> ImageCapture.FLASH_MODE_ON
-                                ImageCapture.FLASH_MODE_ON -> ImageCapture.FLASH_MODE_AUTO
-                                else -> ImageCapture.FLASH_MODE_OFF
-                            }
-                        },
-                        modifier = Modifier
-                            .background(Color(0x7F212121), CircleShape)
-                            .testTag("flash_toggle_button")
-                    ) {
-                        val flashIcon = when (flashMode) {
-                            ImageCapture.FLASH_MODE_ON -> Icons.Default.FlashOn
-                            ImageCapture.FLASH_MODE_AUTO -> Icons.Default.FlashAuto
-                            else -> Icons.Default.FlashOff
-                        }
-                        val flashColor = when (flashMode) {
-                            ImageCapture.FLASH_MODE_ON -> Color(0xFFFFEB3B)
-                            ImageCapture.FLASH_MODE_AUTO -> Color(0xFF00E676)
-                            else -> Color.White
-                        }
-                        Icon(flashIcon, contentDescription = "Flash Options", tint = flashColor)
-                    }
-
-                    // Watermark Preview Badge Indicator
                     Box(
                         modifier = Modifier
                             .background(Color(0x9F00E676), RoundedCornerShape(12.dp))
@@ -338,236 +427,293 @@ fun CameraContent(
                         )
                     }
 
-                    // Camera Switch Lens facing toggler
-                    IconButton(
-                        onClick = {
-                            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-                                CameraSelector.LENS_FACING_FRONT
-                            } else {
-                                CameraSelector.LENS_FACING_BACK
-                            }
-                        },
-                        modifier = Modifier
-                            .background(Color(0x7F212121), CircleShape)
-                            .testTag("lens_facing_toggle_button")
-                    ) {
-                        Icon(
-                            Icons.Default.FlipCameraAndroid,
-                            contentDescription = "Flip Lens",
-                            tint = Color.White
-                        )
+                    if (selectedFilterIndex > 0) {
+                        val activeFilterLabel = when (selectedFilterIndex) {
+                            1 -> "WARM"
+                            2 -> "NOIR"
+                            3 -> "NEON"
+                            4 -> "SEPIA"
+                            5 -> "VIVID"
+                            else -> ""
+                        }
+                        Box(
+                            modifier = Modifier
+                                .background(Color(0xE0FF5722), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = activeFilterLabel,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                        }
                     }
                 }
 
-                // LIVE DYNAMIC GRAPHIC STAMP WATERMARK PREVIEW (Shows user real-time changes!)
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(16.dp),
-                    contentAlignment = when (selectedStyleIndex) {
-                        2 -> Alignment.BottomCenter
-                        3 -> Alignment.BottomStart
-                        else -> Alignment.BottomEnd
-                    }
-                ) {
-                    val formattedLiveTime = remember(selectedStyleIndex, currentTickTime) {
-                        val pattern = when (selectedStyleIndex) {
-                            1 -> "yyyy’MM’dd  HH:mm"
-                            2 -> "yyyy.MM.dd | HH:mm:ss"
-                            else -> "yyyy-MM-dd  HH:mm:ss"
+                // Camera Switch Lens facing toggler
+                IconButton(
+                    onClick = {
+                        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                            CameraSelector.LENS_FACING_FRONT
+                        } else {
+                            CameraSelector.LENS_FACING_BACK
                         }
-                        SimpleDateFormat(pattern, Locale.getDefault()).format(Date(currentTickTime))
+                    },
+                    modifier = Modifier
+                        .background(Color(0x7F212121), CircleShape)
+                        .testTag("lens_facing_toggle_button")
+                ) {
+                    Icon(
+                        Icons.Default.FlipCameraAndroid,
+                        contentDescription = "Flip Lens",
+                        tint = Color.White
+                    )
+                }
+            }
+
+            // LIVE DYNAMIC GRAPHIC STAMP WATERMARK PREVIEW Overlay (In-view positioning)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(16.dp),
+                contentAlignment = when (selectedStyleIndex) {
+                    2 -> Alignment.BottomCenter
+                    3 -> Alignment.BottomStart
+                    else -> Alignment.BottomEnd
+                }
+            ) {
+                val formattedLiveTime = remember(selectedStyleIndex, currentTickTime) {
+                    val pattern = when (selectedStyleIndex) {
+                        1 -> "yyyy’MM’dd  HH:mm"
+                        2 -> "yyyy.MM.dd | HH:mm:ss"
+                        else -> "yyyy-MM-dd  HH:mm:ss"
                     }
+                    SimpleDateFormat(pattern, Locale.getDefault()).format(Date(currentTickTime))
+                }
 
-                    val visualStampText = if (noteText.isNotBlank()) {
-                        "$noteText  •  $formattedLiveTime"
-                    } else {
-                        formattedLiveTime
-                    }
+                val visualStampText = if (noteText.isNotBlank()) {
+                    "$noteText  •  $formattedLiveTime"
+                } else {
+                    formattedLiveTime
+                }
 
-                    val textColor = Color(android.graphics.Color.parseColor(selectedColorHex))
+                val textColor = Color(android.graphics.Color.parseColor(selectedColorHex))
 
-                    AnimatedContent(
-                        targetState = Triple(selectedStyleIndex, visualStampText, textColor),
-                        transitionSpec = {
-                            fadeIn() togetherWith fadeOut()
-                        },
-                        label = "VisualStampChange"
-                    ) { (style, stampString, color) ->
-                        when (style) {
-                            1 -> { // Retro Digital Glow
+                AnimatedContent(
+                    targetState = Triple(selectedStyleIndex, visualStampText, textColor),
+                    transitionSpec = {
+                        fadeIn() togetherWith fadeOut()
+                    },
+                    label = "VisualStampChange"
+                ) { (style, stampString, color) ->
+                    when (style) {
+                        1 -> { // Retro Digital Glow
+                            Text(
+                                text = stampString,
+                                color = Color(0xFFFF5722),
+                                fontSize = 14.sp,
+                                fontFamily = FontFamily.Serif,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .background(Color(0x77000000), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                        2 -> { // Cyber Black Banner overlay style across bottom
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .background(Color(0x99000000))
+                                    .padding(vertical = 6.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
                                 Text(
                                     text = stampString,
-                                    color = Color(0xFFFF5722),
-                                    fontSize = 14.sp,
-                                    fontFamily = FontFamily.Serif,
+                                    color = Color(0xFF00E676),
+                                    fontSize = 13.sp,
+                                    fontFamily = FontFamily.Monospace,
                                     fontWeight = FontWeight.Bold,
-                                    modifier = Modifier
-                                        .background(Color(0x55000000), RoundedCornerShape(4.dp))
-                                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
-                            2 -> { // Cyber Black Banner overlay style across bottom
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .align(Alignment.BottomCenter)
-                                        .background(Color(0x99000000))
-                                        .padding(vertical = 4.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = stampString,
-                                        color = Color(0xFF00E676),
-                                        fontSize = 13.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                            3 -> { // Classic Left Yellow / Custom
-                                Text(
-                                    text = stampString,
-                                    color = color,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    textAlign = TextAlign.Left,
-                                    modifier = Modifier
-                                        .background(Color(0x33000000), RoundedCornerShape(4.dp))
-                                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                                )
-                            }
-                            else -> { // Standard overlay Bottom-Right
-                                Text(
-                                    text = stampString,
-                                    color = color,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    textAlign = TextAlign.Right,
-                                    modifier = Modifier
-                                        .background(Color(0x33000000), RoundedCornerShape(4.dp))
-                                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                                )
-                            }
+                        }
+                        3 -> { // Classic Left Yellow / Custom
+                            Text(
+                                text = stampString,
+                                color = color,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Left,
+                                modifier = Modifier
+                                    .background(Color(0x77000000), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                        else -> { // Standard overlay Bottom-Right
+                            Text(
+                                text = stampString,
+                                color = color,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                textAlign = TextAlign.Right,
+                                modifier = Modifier
+                                    .background(Color(0x77000000), RoundedCornerShape(6.dp))
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
                         }
                     }
                 }
             }
 
-            // CONTROLS & GALLERY PANEL - Bottom 45%
+            // BOTTOM CONTROL DRAWER PANEL - Semi-transparent glassy dark slate background!
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1.0f)
-                    .background(Color(0xFF141414))
+                    .background(Color(0xE0121212))
                     .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.SpaceBetween
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // TABS TO CONFIGURE STAMP FORMAT/STYLE
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    // Style Selector Chips
-                    ScrollableTabRow(
-                        selectedTabIndex = selectedStyleIndex,
-                        containerColor = Color.Transparent,
-                        contentColor = Color.White,
-                        edgePadding = 0.dp,
-                        divider = {},
-                        indicator = {}
-                    ) {
-                        listOf("Classic BR", "Retro LED", "Neon Banner", "Classic BL").forEachIndexed { idx, title ->
-                            Tab(
-                                selected = selectedStyleIndex == idx,
-                                onClick = { viewModel.updateSelectedStyle(idx) },
-                                modifier = Modifier
-                                    .padding(vertical = 4.dp, horizontal = 4.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        if (selectedStyleIndex == idx) Color(0xFFFF5722) else Color(0xFF222222)
-                                    )
-                                    .testTag("style_tab_$idx")
-                            ) {
-                                Text(
-                                    text = title,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (selectedStyleIndex == idx) Color.White else Color.LightGray,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                // Style Selector Chips
+                ScrollableTabRow(
+                    selectedTabIndex = selectedStyleIndex,
+                    containerColor = Color.Transparent,
+                    contentColor = Color.White,
+                    edgePadding = 0.dp,
+                    divider = {},
+                    indicator = {}
+                ) {
+                    listOf("Classic BR", "Retro LED", "Neon Banner", "Classic BL").forEachIndexed { idx, title ->
+                        Tab(
+                            selected = selectedStyleIndex == idx,
+                            onClick = { viewModel.updateSelectedStyle(idx) },
+                            modifier = Modifier
+                                .padding(vertical = 4.dp, horizontal = 4.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(
+                                    if (selectedStyleIndex == idx) Color(0xFFFF5722) else Color(0xFF222222)
                                 )
-                            }
+                                .testTag("style_tab_$idx")
+                        ) {
+                            Text(
+                                text = title,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (selectedStyleIndex == idx) Color.White else Color.LightGray,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
                         }
                     }
+                }
 
-                    // Optional Custom Suffix Text entry
-                    OutlinedTextField(
-                        value = noteText,
-                        onValueChange = { viewModel.updateNoteText(it) },
-                        placeholder = { Text("Add custom note prefix (e.g. Travel, Gym)", fontSize = 13.sp, color = Color.Gray) },
-                        singleLine = true,
-                        leadingIcon = { Icon(Icons.Default.Label, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(18.dp)) },
-                        trailingIcon = {
-                            if (noteText.isNotEmpty()) {
-                                IconButton(onClick = { viewModel.updateNoteText("") }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Clear", modifier = Modifier.size(16.dp))
-                                }
+                // Optional Custom Suffix Text entry
+                OutlinedTextField(
+                    value = noteText,
+                    onValueChange = { viewModel.updateNoteText(it) },
+                    placeholder = { Text("Add custom note prefix (e.g. Travel, Gym)", fontSize = 13.sp, color = Color.Gray) },
+                    singleLine = true,
+                    leadingIcon = { Icon(Icons.Default.Label, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(18.dp)) },
+                    trailingIcon = {
+                        if (noteText.isNotEmpty()) {
+                            IconButton(onClick = { viewModel.updateNoteText("") }) {
+                                Icon(Icons.Default.Close, contentDescription = "Clear", modifier = Modifier.size(16.dp))
                             }
-                        },
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                        keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Color(0xFFFF5722),
-                            unfocusedBorderColor = Color(0xFF333333),
-                            focusedContainerColor = Color(0xFF1E1E1E),
-                            unfocusedContainerColor = Color(0xFF181818),
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .testTag("note_input_field")
+                        }
+                    },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFFFF5722),
+                        unfocusedBorderColor = Color(0xFF333333),
+                        focusedContainerColor = Color(0xFF1E1E1E),
+                        unfocusedContainerColor = Color(0xFF181818),
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White
+                    ),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("note_input_field")
+                )
+
+                // Color selection dots
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Stamp Color:",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.LightGray
                     )
 
-                    // Color selection dots
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Stamp Color:",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.LightGray
-                        )
+                        items(viewModel.availableColors) { (colorHex, colorName) ->
+                            val colorItem = Color(android.graphics.Color.parseColor(colorHex))
+                            Box(
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clip(CircleShape)
+                                    .background(colorItem)
+                                    .border(
+                                        width = if (selectedColorHex == colorHex) 2.dp else 0.dp,
+                                        color = if (selectedColorHex == colorHex) Color.White else Color.Transparent,
+                                        shape = CircleShape
+                                    )
+                                    .clickable { viewModel.updateSelectedColor(colorHex) }
+                                    .testTag("color_choice_$colorHex")
+                            )
+                        }
+                    }
+                }
 
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            items(viewModel.availableColors) { (colorHex, colorName) ->
-                                val colorItem = Color(android.graphics.Color.parseColor(colorHex))
-                                Box(
-                                    modifier = Modifier
-                                        .size(24.dp)
-                                        .clip(CircleShape)
-                                        .background(colorItem)
-                                        .border(
-                                            width = if (selectedColorHex == colorHex) 2.dp else 0.dp,
-                                            color = if (selectedColorHex == colorHex) Color.White else Color.Transparent,
-                                            shape = CircleShape
-                                        )
-                                        .clickable { viewModel.updateSelectedColor(colorHex) }
-                                        .testTag("color_choice_$colorHex")
+                // Aesthetic Photo Filter Selection presets
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "Photo Filter:",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.LightGray
+                    )
+
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        items(viewModel.availableFilters) { (filterName, filterIdx) ->
+                            val isSelected = selectedFilterIndex == filterIdx
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isSelected) Color(0xFFFF5722) else Color(0xFF222222))
+                                    .clickable { viewModel.updateSelectedFilter(filterIdx) }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                                    .testTag("filter_choice_$filterIdx")
+                            ) {
+                                Text(
+                                    text = filterName,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isSelected) Color.White else Color.LightGray
                                 )
                             }
                         }
                     }
                 }
 
-                // DETAILED SNAP CONTROL TRIGGER AREA AND RECENT SQUIRCLE GALLERY PANEL
+                // Snap photo triggers & library access
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -586,13 +732,7 @@ fun CameraContent(
                                 if (photos.isNotEmpty()) {
                                     activePhotoView = photos.first()
                                 } else {
-                                    Toast
-                                        .makeText(
-                                            context,
-                                            "No photos captured yet! Snap a photo first.",
-                                            Toast.LENGTH_SHORT
-                                        )
-                                        .show()
+                                    Toast.makeText(context, "No photos captured yet! Snap a photo first.", Toast.LENGTH_SHORT).show()
                                 }
                             }
                             .testTag("gallery_thumbnail_view"),
@@ -629,6 +769,7 @@ fun CameraContent(
                                     noteText = noteText,
                                     selectedColorHex = selectedColorHex,
                                     selectedStyleIndex = selectedStyleIndex,
+                                    filterIndex = selectedFilterIndex,
                                     mainExecutor = mainExecutor
                                 )
                             }
@@ -873,6 +1014,7 @@ private fun executePhotoSnapping(
     noteText: String,
     selectedColorHex: String,
     selectedStyleIndex: Int,
+    filterIndex: Int,
     mainExecutor: java.util.concurrent.Executor
 ) {
     viewModel.setCapturing(true)
@@ -901,7 +1043,8 @@ private fun executePhotoSnapping(
                             photoFile = outputPhotoFile,
                             customText = noteText,
                             colorHex = selectedColorHex,
-                            styleIndex = selectedStyleIndex
+                            styleIndex = selectedStyleIndex,
+                            filterIndex = filterIndex
                         )
 
                         // Insert photo path into SQLite Database

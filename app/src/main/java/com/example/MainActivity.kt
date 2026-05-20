@@ -26,12 +26,10 @@ class MainActivity : ComponentActivity() {
 
     setContent {
       MyApplicationTheme {
-        Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-          CameraScreen(
-              viewModel = viewModel,
-              modifier = Modifier.padding(innerPadding)
-          )
-        }
+        CameraScreen(
+            viewModel = viewModel,
+            modifier = Modifier.fillMaxSize()
+        )
       }
     }
   }

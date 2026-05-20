@@ -62,6 +62,23 @@ class CameraViewModel(application: Application) : AndroidViewModel(application) 
     private val _selectedStyleIndex = MutableStateFlow(0)
     val selectedStyleIndex: StateFlow<Int> = _selectedStyleIndex.asStateFlow()
 
+    // Pre-configured dynamic Image Filters (0: Off, 1: Warm Vintage, 2: Noir Noir, 3: Cool Neon, 4: Vintage Sepia, 5: Vivid Drama)
+    val availableFilters = listOf(
+        "Normal" to 0,
+        "Warm" to 1,
+        "Noir" to 2,
+        "Neon" to 3,
+        "Sepia" to 4,
+        "Vivid" to 5
+    )
+
+    private val _selectedFilterIndex = MutableStateFlow(0)
+    val selectedFilterIndex: StateFlow<Int> = _selectedFilterIndex.asStateFlow()
+
+    fun updateSelectedFilter(index: Int) {
+        _selectedFilterIndex.value = index
+    }
+
     fun updateNoteText(text: String) {
         _noteText.value = text
     }
