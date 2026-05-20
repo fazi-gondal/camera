@@ -1,0 +1,6 @@
+{
+  "name": "Stamp Camera",
+  "description": "Take beautiful photos embedded with visual, customizable real-time date/time stamps and store them in local history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
